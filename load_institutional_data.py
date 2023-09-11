@@ -2,139 +2,105 @@ import os
 import sqlite3
 import pandas as pd
 
-dir = "./scorecard"
+DATA_DIR = "./scorecard"
+DB_PATH = 'scorecard.db'
 
-################################################################################
+def read_data_dictionary():
+    """Reads the data dictionary and extracts relevant information."""
+    dict_path = os.path.join(DATA_DIR, "CollegeScorecardDataDictionary.xlsx")
+    dict_df = pd.read_excel(dict_path, sheet_name="Institution_Data_Dictionary")
+    dict_df = dict_df[["VARIABLE NAME", "dev-category", "API data type", "developer-friendly name"]]
+    dict_df = dict_df.dropna(subset=["VARIABLE NAME"])
+    return dict_df
 
-# Read the data dictionary
-dict_path = os.path.join(dir, "CollegeScorecardDataDictionary.xlsx")
-dict_df = pd.read_excel(dict_path, sheet_name="Institution_Data_Dictionary")
+def map_variables_to_categories(dict_df):
+    """Maps variables to their respective categories."""
+    categories = dict_df.groupby('dev-category')
+    category_mappings = {}
 
-# Extract the required columns and drop missing rows
-dict_df = dict_df[["VARIABLE NAME", "dev-category", "API data type", "developer-friendly name"]]
-dict_df = dict_df.dropna(subset=["VARIABLE NAME"])
+    for category, group in categories:
+        columns = ["cohort", "UNITID"] + group['VARIABLE NAME'].tolist()
+        if category != "root":
+            category_mappings[category] = columns
 
-print(dict_df.head())
+    return category_mappings
 
-# Group the variables by their category
-categories = dict_df.groupby('dev-category')
+def create_database_tables(category_mappings, dict_df):
+    """Creates the database tables based on the category mappings."""
+    data_type_mapping = {
+        "autocomplete": "TEXT",
+        "integer": "INTEGER",
+        "float": "REAL",
+        "long": "INTEGER",
+        "string": "TEXT"
+    }
 
-category_mappings = {}
-for category, group in categories:
-    if category != "root":
-        category_mappings[category] = ["cohort", "UNITID"] + group['VARIABLE NAME'].tolist()
-    else:
-        category_mappings[category] = ["cohort"] + group['VARIABLE NAME'].tolist()
+    with sqlite3.connect(DB_PATH) as conn:
+        # Drop previously created tables
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+        for table_name, in tables:
+            conn.execute(f"DROP TABLE IF EXISTS {table_name};")
 
-print("Successfully mapped variables to categories.")
+        # Create tables for each category
+        for category, columns in category_mappings.items():
+            table_name = category.replace("-", "_")
+            column_types = [
+                f"{col} {data_type_mapping[dict_df[dict_df['VARIABLE NAME'] == col]['API data type'].values[0]]}"
+                for col in columns if col not in ["cohort", "UNITID"]
+            ]
 
-################################################################################
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                UNITID INTEGER,
+                cohort TEXT,
+                {', '.join(column_types)},
+                PRIMARY KEY (UNITID, cohort),
+                FOREIGN KEY(UNITID, cohort) REFERENCES root(UNITID, cohort)
+            );"""
+            conn.execute(create_table_sql)
 
-conn = sqlite3.connect('education.db')
+        return [table_name[0] for table_name in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
 
-data_type_mapping = {
-    "autocomplete": "TEXT",
-    "integer": "INTEGER",
-    "float": "REAL",
-    "long": "INTEGER",
-    "string": "TEXT"
-}
+def read_institutional_data():
+    """Reads and processes the institutional data."""
+    dfs = []
 
-# Drop the previously created tables to start fresh
-tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
-tables = [table[0] for table in tables]
-for table in tables:
-    conn.execute(f"DROP TABLE IF EXISTS {table};")
+    for filename in os.listdir(DATA_DIR):
+        if filename.startswith("MERGED") and filename.endswith(".csv"):
+            filepath = os.path.join(DATA_DIR, filename)
+            df = pd.read_csv(filepath)
+            df.replace('PrivacySuppressed', pd.NA, inplace=True)
+            df['cohort'] = filename.replace("MERGED", "").replace("_PP.csv", "")
+            dfs.append(df)
 
-# For each category, excluding "root", create a SQL table
-for category, columns in category_mappings.items():
-    # Create a table for the category
-    table_name = category.replace("-", "_")  # Make sure table name is SQL friendly
+    print("Now merging the CSV files...")
+    return pd.concat(dfs, axis=0, ignore_index=True, sort=False)
 
-    input_columns = [col for col in columns if col not in ["cohort", "UNITID"]]
-    column_types = [
-        f"{col} " +
-        f"{data_type_mapping[dict_df[dict_df['VARIABLE NAME'] == col]['API data type'].values[0]]}"
-        for col in input_columns
-    ]
+def upload_to_db(df, category_mappings):
+    """Uploads the dataframe to the database based on the category mappings."""
 
-    create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            UNITID INTEGER,
-            cohort TEXT,
-            {', '.join(column_types)},
-            PRIMARY KEY (UNITID, cohort),
-            FOREIGN KEY(UNITID, cohort) REFERENCES root(UNITID, cohort)
-        );"""
+    with sqlite3.connect(DB_PATH) as conn:
+        for category, columns in category_mappings.items():
+            print("Now loading data to the", category, "table...")
+            valid_columns = [col for col in columns if col in df.columns]
+            subset_df = df[valid_columns].drop_duplicates()
+            subset_df.to_sql(category, conn, if_exists='append', index=False)
 
-    conn.execute(create_table_sql)
+def main():
+    dict_df = read_data_dictionary()
+    print(dict_df.head())
 
-# Commit the changes
-conn.commit()
+    category_mappings = map_variables_to_categories(dict_df)
+    print("Successfully mapped variables to categories.")
 
-# Fetch the names of all tables in the database to confirm creation
-tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
-tables = [table[0] for table in tables]
+    created_tables = create_database_tables(category_mappings, dict_df)
+    print("Successfully created database tables.")
+    print(created_tables)
 
-conn.close()
+    merged_df = read_institutional_data()
+    print("Successfully merged CSV files.")
 
-print("Successfully created database tables.")
-print(tables)
+    upload_to_db(merged_df, category_mappings)
 
-################################################################################
-
-dfs = []
-
-def convert_data_types(df, dict_df):
-    for col in df.columns:
-        if col in dict_df['VARIABLE NAME'].values:
-            desired_dtype = dict_df[dict_df['VARIABLE NAME'] == col]['API data type'].values[0]
-            if desired_dtype == 'integer':
-                df[col] = pd.to_numeric(df[col], errors='coerce', downcast='integer')
-            elif desired_dtype == 'float':
-                df[col] = pd.to_numeric(df[col], errors='coerce', downcast='float')
-            # no explicit conversion required for string type
-    return df
-
-# Read and process the institutional data
-for filename in os.listdir(dir):
-    filepath = os.path.join(dir, filename)
-
-    # Read CSV files with the "MERGED" prefix
-    if filename.startswith("MERGED") and filename.endswith(".csv"):
-        df = pd.read_csv(filepath)
-
-        # Replace privacy suppressed notes with NULL
-        df.replace('PrivacySuppressed', pd.NA)
-
-        df['cohort'] = filename.replace("MERGED", "", 1) \
-                               .replace("_PP.csv", "", 1)
-        dfs.append(df)
-
-# Concatenate all institutional data
-print("Now merging the CSV files...")
-merged_df = pd.concat(dfs, axis=0, ignore_index=True, sort=False)
-print("Successfully merged CSV files.")
-
-################################################################################
-
-# Function to split and upload data to the respective tables
-def upload_to_db(df, category_mappings, conn):
-
-    # For each category in the mapping, extract the relevant columns and upload to its table
-    for category, columns in category_mappings.items():
-        table_name = category.replace("-", "_")
-
-        # Check if data dictionary columns exist in the data
-        valid_columns = [col for col in columns if col in df.columns]
-        invalid_columns = [col for col in columns if col not in df.columns]
-        print("Warning:", category, "is missing", invalid_columns)
-
-        subset_df = df[valid_columns].drop_duplicates()
-        subset_df.to_sql(table_name, conn, if_exists='append', index=False)
-
-# Connect to database and write SQL tables
-conn = sqlite3.connect('education.db')
-upload_to_db(merged_df, category_mappings, conn)
-conn.commit()
-conn.close()
+if __name__ == "__main__":
+    main()
